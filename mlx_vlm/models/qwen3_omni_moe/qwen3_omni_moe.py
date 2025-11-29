@@ -532,9 +532,21 @@ class Model(nn.Module):
         talker_top_p: float = 1.0,
         talker_temperature: float = 0.9,
         chunk_size: int = 300,
+        initial_chunk_size: int = None,
         left_context_size: int = 25,
+        debug: bool = False,
         **kwargs,
     ):
+        import time as _time
+
+        def _sync():
+            if debug:
+                mx.synchronize()
+
+        def _debug(msg):
+            if debug:
+                print(f"[DEBUG] {msg}")
+
         if not self.has_talker:
             raise ValueError("Cannot stream audio without talker module")
         if input_ids.shape[0] != 1:
@@ -550,6 +562,7 @@ class Model(nn.Module):
             "max_tokens": thinker_max_new_tokens,
             "eos_tokens": [thinker_eos_token_id],
         }
+        embed_kwargs = {}
         for key, value in kwargs.items():
             if key.startswith("thinker_"):
                 thinker_kwargs[key[len("thinker_") :]] = value
@@ -563,6 +576,40 @@ class Model(nn.Module):
                 "video_grid_thw",
             ):
                 thinker_kwargs[key] = value
+                if key in (
+                    "pixel_values",
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "input_features",
+                    "feature_attention_mask",
+                    "audio_feature_lengths",
+                ):
+                    embed_kwargs[key] = value
+
+        t0 = _time.perf_counter()
+
+        input_len = input_ids.shape[1]
+        input_embeds, _, _ = self.thinker.get_input_embeddings(
+            input_ids, **embed_kwargs
+        )
+
+        lm_kwargs = {
+            k: v for k, v in kwargs.items() if k in ["image_grid_thw", "video_grid_thw"]
+        }
+        outputs = self.thinker.language_model(
+            input_ids,
+            inputs_embeds=input_embeds,
+            output_hidden_states=True,
+            **lm_kwargs,
+        )
+        thinker_hidden_input = outputs.hidden_states[
+            self.config.talker_config.accept_hidden_layer + 1
+        ]
+
+        _sync()
+        t_prefill = _time.perf_counter()
+        _debug(f"Thinker prefill + hidden: {t_prefill-t0:.3f}s")
 
         generator = generate_step(
             input_ids,
@@ -576,17 +623,37 @@ class Model(nn.Module):
             },
         )
         sequences = [input_ids]
+        thinker_tokens = 0
         for token, _ in generator:
             sequences.append(mx.array([[token]]))
+            thinker_tokens += 1
             if token == thinker_eos_token_id:
                 break
 
         thinker_result_sequences = mx.concatenate(sequences, axis=1)
-        thinker_hidden_all, thinker_embed_all = self.extract_thinker_hidden_states(
-            thinker_result_sequences,
-            target_layer_idx=self.config.talker_config.accept_hidden_layer,
-            **kwargs,
+        _sync()
+        t1 = _time.perf_counter()
+        _debug(
+            f"Thinker generate: {t1-t_prefill:.3f}s, {thinker_tokens} tokens, {thinker_tokens/(t1-t_prefill):.1f} tok/s"
         )
+
+        generated_ids = thinker_result_sequences[:, input_len:]
+        generated_embeds = self.thinker.language_model.model.embed_tokens(generated_ids)
+        thinker_embed_all = mx.concatenate([input_embeds, generated_embeds], axis=1)
+        thinker_hidden_all = mx.concatenate(
+            [
+                thinker_hidden_input,
+                mx.zeros(
+                    (1, generated_ids.shape[1], thinker_hidden_input.shape[-1]),
+                    dtype=thinker_hidden_input.dtype,
+                ),
+            ],
+            axis=1,
+        )
+
+        _sync()
+        t2 = _time.perf_counter()
+        _debug(f"Embed concat: {t2-t1:.3f}s")
 
         im_start_indexes = mx.concatenate(
             (
@@ -670,12 +737,24 @@ class Model(nn.Module):
 
         talker_input_embed = mx.concatenate(talker_input_embeds, axis=1)
         talker_input_id = mx.concatenate(talker_input_ids, axis=1)
+        _sync()
+        t3 = _time.perf_counter()
+        _debug(
+            f"Talker prefill prep: {t3-t2:.3f}s, embed shape {talker_input_embed.shape}"
+        )
 
         generated_tokens = thinker_result_sequences[0, input_ids.shape[1] :].tolist()
         yield ("text", generated_tokens)
 
         codes_list = []
         decoded_len = 0
+        talker_first_token_time = None
+        first_audio_chunk_time = None
+        talker_token_count = 0
+        audio_chunk_count = 0
+        current_chunk_size = (
+            initial_chunk_size if initial_chunk_size is not None else chunk_size
+        )
 
         for residual_codes in self.talker.generate_stream(
             inputs_embeds=talker_input_embed,
@@ -686,15 +765,34 @@ class Model(nn.Module):
             temperature=talker_temperature,
             top_p=talker_top_p,
         ):
+            if talker_first_token_time is None:
+                _sync()
+                talker_first_token_time = _time.perf_counter()
+                _debug(f"Talker first token: {talker_first_token_time-t3:.3f}s (TTFT)")
+            talker_token_count += 1
             codes_list.append(residual_codes)
-            if len(codes_list) >= chunk_size:
+            if len(codes_list) >= current_chunk_size:
                 codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
                 wav_chunk, decoded_len = self.code2wav.stream_decode(
-                    codes_buffer, chunk_size, left_context_size, decoded_len
+                    codes_buffer, current_chunk_size, left_context_size, decoded_len
                 )
                 if wav_chunk is not None:
                     mx.eval(wav_chunk)
+                    audio_chunk_count += 1
+                    if first_audio_chunk_time is None:
+                        first_audio_chunk_time = _time.perf_counter()
+                        _debug(
+                            f"First audio chunk: {first_audio_chunk_time-t0:.3f}s (TTFA)"
+                        )
+                        current_chunk_size = chunk_size
                     yield ("audio", wav_chunk.astype(mx.float32))
+
+        _sync()
+        t4 = _time.perf_counter()
+        if talker_first_token_time:
+            _debug(
+                f"Talker generate: {t4-talker_first_token_time:.3f}s, {talker_token_count} tokens, {talker_token_count/(t4-talker_first_token_time):.1f} tok/s"
+            )
 
         if codes_list:
             codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
@@ -703,4 +801,346 @@ class Model(nn.Module):
             )
             if wav_chunk is not None:
                 mx.eval(wav_chunk)
+                audio_chunk_count += 1
+                if first_audio_chunk_time is None:
+                    first_audio_chunk_time = _time.perf_counter()
+                    _debug(
+                        f"First audio chunk: {first_audio_chunk_time-t0:.3f}s (TTFA)"
+                    )
                 yield ("audio", wav_chunk.astype(mx.float32))
+
+        t5 = _time.perf_counter()
+        _debug(f"Code2wav total chunks: {audio_chunk_count}")
+        _debug(f"Total time: {t5-t0:.3f}s")
+
+    def generate_stream_interleaved(
+        self,
+        input_ids: mx.array,
+        speaker: str = "Ethan",
+        thinker_max_new_tokens: int = 1024,
+        thinker_eos_token_id: int = 151645,
+        talker_max_new_tokens: int = 4096,
+        talker_top_p: float = 1.0,
+        talker_temperature: float = 0.9,
+        chunk_size: int = 300,
+        initial_chunk_size: int = None,
+        left_context_size: int = 25,
+        thinker_head_start: int = 10,
+        debug: bool = False,
+        **kwargs,
+    ):
+        import time as _time
+
+        def _sync():
+            if debug:
+                mx.synchronize()
+
+        def _debug(msg):
+            if debug:
+                print(f"[DEBUG] {msg}")
+
+        if not self.has_talker:
+            raise ValueError("Cannot stream audio without talker module")
+        if input_ids.shape[0] != 1:
+            raise NotImplementedError("Streaming does not support batched inference")
+
+        speaker_id = self.config.talker_config.speaker_id.get(speaker.lower())
+        if speaker_id is None:
+            raise NotImplementedError(f"Speaker {speaker} not implemented")
+
+        from mlx_vlm.generate import generate_step
+
+        thinker_kwargs = {
+            "max_tokens": thinker_max_new_tokens,
+            "eos_tokens": [thinker_eos_token_id],
+        }
+        embed_kwargs = {}
+        for key, value in kwargs.items():
+            if key.startswith("thinker_"):
+                thinker_kwargs[key[len("thinker_") :]] = value
+            elif key in (
+                "input_features",
+                "feature_attention_mask",
+                "audio_feature_lengths",
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+            ):
+                thinker_kwargs[key] = value
+                embed_kwargs[key] = value
+
+        t0 = _time.perf_counter()
+
+        input_len = input_ids.shape[1]
+        input_embeds, _, _ = self.thinker.get_input_embeddings(
+            input_ids, **embed_kwargs
+        )
+
+        lm_kwargs = {
+            k: v for k, v in kwargs.items() if k in ["image_grid_thw", "video_grid_thw"]
+        }
+        outputs = self.thinker.language_model(
+            input_ids,
+            inputs_embeds=input_embeds,
+            output_hidden_states=True,
+            **lm_kwargs,
+        )
+        thinker_hidden_input = outputs.hidden_states[
+            self.config.talker_config.accept_hidden_layer + 1
+        ]
+
+        _sync()
+        t_prefill = _time.perf_counter()
+        _debug(f"Thinker prefill + hidden: {t_prefill-t0:.3f}s")
+
+        thinker_generator = generate_step(
+            input_ids,
+            self.thinker,
+            thinker_kwargs.get("pixel_values"),
+            kwargs.get("mask"),
+            **{
+                k: v
+                for k, v in thinker_kwargs.items()
+                if k not in ("pixel_values", "mask")
+            },
+        )
+
+        generated_token_ids = []
+        thinker_finished = False
+
+        min_tokens_needed = 4
+        for token, _ in thinker_generator:
+            generated_token_ids.append(token)
+            if token == thinker_eos_token_id:
+                thinker_finished = True
+                break
+            if len(generated_token_ids) >= min_tokens_needed + thinker_head_start:
+                break
+
+        _sync()
+        t_head = _time.perf_counter()
+        _debug(
+            f"Thinker head start: {t_head-t_prefill:.3f}s, {len(generated_token_ids)} tokens"
+        )
+
+        multimodal_mask = (
+            (input_ids == self.config.thinker_config.audio_token_id)
+            | (input_ids == self.config.thinker_config.image_token_id)
+            | (input_ids == self.config.thinker_config.video_token_id)
+        )
+
+        im_start_positions = np.where(
+            np.array(input_ids[0] == self.config.im_start_token_id)
+        )[0]
+
+        talker_special_tokens = mx.array(
+            [
+                [
+                    self.config.tts_bos_token_id,
+                    self.config.tts_eos_token_id,
+                    self.config.tts_pad_token_id,
+                ]
+            ],
+            dtype=input_ids.dtype,
+        )
+        talker_special_embeds = self.thinker.language_model.model.embed_tokens(
+            talker_special_tokens
+        )
+        talker_special_embeds_proj = self.talker.text_projection(talker_special_embeds)
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = (
+            talker_special_embeds_proj[:, 0:1],
+            talker_special_embeds_proj[:, 1:2],
+            talker_special_embeds_proj[:, 2:3],
+        )
+
+        talker_input_embeds_list = []
+        assistant_start_idx = None
+
+        for i in range(len(im_start_positions)):
+            im_start = int(im_start_positions[i])
+            if i + 1 < len(im_start_positions):
+                segment_end = int(im_start_positions[i + 1])
+            else:
+                segment_end = input_len
+
+            role_token = int(input_ids[0, im_start + 1])
+
+            if role_token == self.config.system_token_id:
+                continue
+            elif role_token == self.config.user_token_id:
+                talker_input_embeds_list.append(
+                    self._get_talker_user_parts(
+                        im_start,
+                        segment_end,
+                        multimodal_mask,
+                        thinker_hidden_input,
+                        input_embeds,
+                    )
+                )
+            elif role_token == self.config.assistant_token_id:
+                assistant_start_idx = im_start
+
+        if assistant_start_idx is None:
+            return
+
+        gen_ids_array = mx.array([generated_token_ids], dtype=input_ids.dtype)
+        gen_embeds = self.thinker.language_model.model.embed_tokens(gen_ids_array)
+
+        assistant_header_embed = input_embeds[:, assistant_start_idx:input_len]
+        full_assistant_embed = mx.concatenate(
+            [assistant_header_embed, gen_embeds], axis=1
+        )
+
+        assistant_hidden = self.talker.text_projection(full_assistant_embed)
+        codec_special_tokens = mx.array(
+            [
+                [
+                    self.config.talker_config.codec_nothink_id,
+                    self.config.talker_config.codec_think_bos_id,
+                    self.config.talker_config.codec_think_eos_id,
+                    speaker_id,
+                    self.config.talker_config.codec_pad_id,
+                    self.config.talker_config.codec_bos_id,
+                ]
+            ],
+            dtype=mx.int32,
+        )
+        assistant_codec_hidden = mx.concatenate(
+            (
+                mx.zeros(
+                    (1, 3, self.config.talker_config.text_config.hidden_size),
+                    dtype=input_embeds.dtype,
+                ),
+                self.talker.model.codec_embedding(codec_special_tokens),
+            ),
+            axis=1,
+        )
+        assistant_text_hidden = mx.concatenate(
+            (
+                assistant_hidden[:, :3],
+                mx.broadcast_to(tts_pad_embed, (1, 4, tts_pad_embed.shape[-1])),
+                tts_bos_embed,
+                assistant_hidden[:, 3:4],
+            ),
+            axis=1,
+        )
+        talker_assistant_input = assistant_text_hidden + assistant_codec_hidden
+        talker_input_embeds_list.append(talker_assistant_input)
+
+        talker_input_embed = mx.concatenate(talker_input_embeds_list, axis=1)
+
+        trailing_embeds_buffer = [
+            assistant_hidden[:, 4 + i : 4 + i + 1]
+            for i in range(len(generated_token_ids) - 1)
+        ]
+
+        def get_trailing_fn(step):
+            nonlocal thinker_finished
+            while not thinker_finished and step >= len(trailing_embeds_buffer):
+                try:
+                    token, _ = next(thinker_generator)
+                    generated_token_ids.append(token)
+                    tok_embed = self.thinker.language_model.model.embed_tokens(
+                        mx.array([[token]], dtype=input_ids.dtype)
+                    )
+                    trailing_embeds_buffer.append(
+                        self.talker.text_projection(tok_embed)
+                    )
+                    if token == thinker_eos_token_id:
+                        trailing_embeds_buffer.append(tts_eos_embed)
+                        thinker_finished = True
+                        break
+                except StopIteration:
+                    trailing_embeds_buffer.append(tts_eos_embed)
+                    thinker_finished = True
+                    break
+
+            if step < len(trailing_embeds_buffer):
+                return trailing_embeds_buffer[step]
+            return None
+
+        _sync()
+        t_prep = _time.perf_counter()
+        _debug(
+            f"Talker prep: {t_prep-t_head:.3f}s, embed shape {talker_input_embed.shape}"
+        )
+
+        codes_list = []
+        decoded_len = 0
+        talker_first_token_time = None
+        first_audio_chunk_time = None
+        talker_token_count = 0
+        audio_chunk_count = 0
+        current_chunk_size = (
+            initial_chunk_size if initial_chunk_size is not None else chunk_size
+        )
+        text_yielded = False
+
+        for residual_codes in self.talker.generate_stream_interleaved(
+            inputs_embeds=talker_input_embed,
+            tts_pad_embed=tts_pad_embed,
+            get_trailing_fn=get_trailing_fn,
+            max_new_tokens=talker_max_new_tokens,
+            temperature=talker_temperature,
+            top_p=talker_top_p,
+        ):
+            if talker_first_token_time is None:
+                _sync()
+                talker_first_token_time = _time.perf_counter()
+                _debug(
+                    f"Talker first token: {talker_first_token_time-t_prep:.3f}s (TTFT)"
+                )
+
+            if not text_yielded and thinker_finished:
+                yield ("text", generated_token_ids)
+                text_yielded = True
+
+            talker_token_count += 1
+            codes_list.append(residual_codes)
+
+            if len(codes_list) >= current_chunk_size:
+                codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
+                wav_chunk, decoded_len = self.code2wav.stream_decode(
+                    codes_buffer, current_chunk_size, left_context_size, decoded_len
+                )
+                if wav_chunk is not None:
+                    mx.eval(wav_chunk)
+                    audio_chunk_count += 1
+                    if first_audio_chunk_time is None:
+                        first_audio_chunk_time = _time.perf_counter()
+                        _debug(
+                            f"First audio chunk: {first_audio_chunk_time-t0:.3f}s (TTFA)"
+                        )
+                        current_chunk_size = chunk_size
+                    yield ("audio", wav_chunk.astype(mx.float32))
+
+        if not text_yielded:
+            yield ("text", generated_token_ids)
+
+        _sync()
+        t4 = _time.perf_counter()
+        if talker_first_token_time:
+            _debug(
+                f"Talker generate: {t4-talker_first_token_time:.3f}s, {talker_token_count} tokens, {talker_token_count/(t4-talker_first_token_time):.1f} tok/s"
+            )
+        _debug(f"Thinker total tokens: {len(generated_token_ids)}")
+
+        if codes_list:
+            codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
+            wav_chunk = self.code2wav.flush_decode(
+                codes_buffer, left_context_size, decoded_len
+            )
+            if wav_chunk is not None:
+                mx.eval(wav_chunk)
+                audio_chunk_count += 1
+                if first_audio_chunk_time is None:
+                    first_audio_chunk_time = _time.perf_counter()
+                    _debug(
+                        f"First audio chunk: {first_audio_chunk_time-t0:.3f}s (TTFA)"
+                    )
+                yield ("audio", wav_chunk.astype(mx.float32))
+
+        t5 = _time.perf_counter()
+        _debug(f"Code2wav total chunks: {audio_chunk_count}")
+        _debug(f"Total time: {t5-t0:.3f}s")

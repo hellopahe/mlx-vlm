@@ -113,6 +113,7 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    code_predictor_bits: Optional[int] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -120,13 +121,17 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    skip_code_predictor = code_predictor_bits is None
+
     def base_quant_predicate(path, module):
-        if skip_multimodal_module(path):
+        if skip_multimodal_module(path, skip_code_predictor=skip_code_predictor):
             return False
         if not hasattr(module, "to_quantized"):
             return False
         if module.weight.shape[1] % q_group_size != 0:
             return False
+        if code_predictor_bits is not None and "code_predictor" in path:
+            return {"group_size": q_group_size, "bits": code_predictor_bits}
         return True
 
     if isinstance(quant_predicate, str):
@@ -225,6 +230,12 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=QUANT_RECIPES,
         type=str,
         required=False,
+    )
+    parser.add_argument(
+        "--code-predictor-bits",
+        help="Bits for code_predictor quantization (e.g. 8). If not set, code_predictor is not quantized.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--upload-repo",

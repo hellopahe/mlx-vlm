@@ -41,24 +41,27 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
-def skip_multimodal_module(path: str) -> bool:
+def skip_multimodal_module(path: str, skip_code_predictor: bool = True) -> bool:
     """
     Check if a multimodal module (vision/audio) should skip quantization.
 
     Args:
         path: The module path to check
+        skip_code_predictor: Whether to skip code_predictor quantization
 
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
+    base_skip = (
         "vision_model" in path
         or "vision_tower" in path
         or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
-        or "code_predictor" in path
     )
+    if skip_code_predictor:
+        return base_skip or "code_predictor" in path
+    return base_skip
 
 
 def get_model_and_args(config: dict):

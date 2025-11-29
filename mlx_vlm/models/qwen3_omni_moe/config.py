@@ -110,7 +110,6 @@ class VisionConfig(BaseModelConfig):
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    model_type: str
     num_hidden_layers: int
     hidden_size: int
     intermediate_size: int
@@ -141,6 +140,7 @@ class TextConfig(BaseModelConfig):
     router_aux_loss_coef: float = 0.001
     use_qk_norm: bool = False
     initializer_range: float = 0.02
+    model_type: str = ""
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

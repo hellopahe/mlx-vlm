@@ -861,6 +861,123 @@ class Talker(nn.Module):
 
             generation_step += 1
 
+    def generate_stream_interleaved(
+        self,
+        inputs_embeds: mx.array,
+        tts_pad_embed: mx.array,
+        get_trailing_fn,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.9,
+        top_p: float = 1.0,
+    ):
+        past_key_values = [
+            KVCache() for _ in range(self.config.text_config.num_hidden_layers)
+        ]
+        logits, hidden_states = self(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+
+        if temperature == 0:
+            token = mx.argmax(logits[:, -1, :], axis=-1)
+        else:
+            token = top_p_sampling(logits[:, -1, :], top_p, temperature)
+
+        generation_step = 0
+        past_hidden = hidden_states[:, -1:]
+
+        for _ in range(max_new_tokens):
+            token_scalar = token.item()
+            if token_scalar == self.config.codec_eos_token_id:
+                break
+
+            trailing = get_trailing_fn(generation_step)
+            if trailing is None:
+                trailing = tts_pad_embed
+
+            inputs_embeds, residual_codes = self._prepare_inputs_interleaved(
+                input_ids=token[:, None],
+                past_hidden=past_hidden,
+                trailing=trailing,
+                temperature=temperature,
+                top_p=0.8,
+            )
+
+            logits, hidden_states = self(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_hidden = hidden_states[:, -1:]
+
+            yield residual_codes
+
+            if temperature == 0:
+                token = mx.argmax(logits[:, -1, :], axis=-1)
+            else:
+                token = top_p_sampling(logits[:, -1, :], top_p, temperature)
+
+            generation_step += 1
+
+    def _prepare_inputs_interleaved(
+        self,
+        input_ids: mx.array,
+        past_hidden: mx.array,
+        trailing: mx.array,
+        temperature: float = 0.9,
+        top_p: float = 0.8,
+    ):
+        last_id_hidden = self.model.codec_embedding(input_ids)
+        cp_input_embeds = mx.concatenate([past_hidden, last_id_hidden], axis=1)
+        cp_past_key_values = [
+            KVCache() for _ in range(len(self.code_predictor.model.layers))
+        ]
+
+        cp_logits, cp_hidden, _ = self.code_predictor(
+            inputs_embeds=cp_input_embeds,
+            past_key_values=cp_past_key_values,
+            use_cache=True,
+        )
+
+        if temperature == 0:
+            cp_token = mx.argmax(cp_logits[:, -1, :], axis=-1)
+        else:
+            cp_token = top_p_sampling(cp_logits[:, -1, :], top_p, temperature)
+
+        current_step_codes = [input_ids, cp_token[:, None]]
+        mid_residual_hiddens = []
+
+        for cp_step in range(1, self.config.num_code_groups - 1):
+            cp_logits, cp_hidden, cp_input_embeds_out = self.code_predictor(
+                input_ids=cp_token[:, None],
+                past_key_values=cp_past_key_values,
+                use_cache=True,
+                generation_steps=cp_step,
+            )
+            mid_residual_hiddens.append(cp_input_embeds_out)
+
+            if temperature == 0:
+                cp_token = mx.argmax(cp_logits[:, -1, :], axis=-1)
+            else:
+                cp_token = top_p_sampling(cp_logits[:, -1, :], top_p, temperature)
+
+            current_step_codes.append(cp_token[:, None])
+
+        last_residual_hidden = self.code_predictor.model.codec_embedding[-1](
+            cp_token[:, None]
+        )
+
+        codec_hiddens = [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
+        codec_hiddens_stacked = mx.concatenate(codec_hiddens, axis=1)
+        inputs_embeds = mx.sum(codec_hiddens_stacked, axis=1, keepdims=True)
+        inputs_embeds = inputs_embeds + trailing
+
+        residual_codes = mx.concatenate(current_step_codes, axis=1)
+        return inputs_embeds, residual_codes
+
     def sanitize(self, weights):
         for l in range(self.config.text_config.num_hidden_layers):
             prefix = f"talker.model.layers.{l}.mlp"

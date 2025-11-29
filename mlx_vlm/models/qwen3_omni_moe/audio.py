@@ -236,12 +236,12 @@ class AudioModel(nn.Module):
 
         padded_feature = padded_feature[:, None, :, :]
 
-        feature_lens_after_cnn = _get_feat_extract_output_lengths(feature_lens)
-        max_len_after_cnn = int(feature_lens_after_cnn.max())
+        chunk_lengths_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
+        max_len_after_cnn = int(chunk_lengths_after_cnn.max())
         padded_mask_after_cnn = mx.zeros(
             (total_chunks, max_len_after_cnn), dtype=mx.bool_
         )
-        for i, length in enumerate(feature_lens_after_cnn):
+        for i, length in enumerate(chunk_lengths_after_cnn):
             padded_mask_after_cnn[i, : int(length)] = True
 
         padded_embeds = []
@@ -276,18 +276,7 @@ class AudioModel(nn.Module):
             axis=0,
         )
 
-        cu_chunk_lens = []
-        window_aftercnn = max_len_after_cnn * (
-            self.n_window_infer // (self.n_window * 2)
-        )
-        for cnn_len in feature_lens_after_cnn:
-            cnn_len_int = int(cnn_len)
-            num_windows = cnn_len_int // window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_windows)
-            remainder = cnn_len_int % window_aftercnn
-            if remainder != 0:
-                cu_chunk_lens.append(remainder)
-
+        cu_chunk_lens = [int(l) for l in chunk_lengths_after_cnn]
         cu_seqlens = mx.cumsum(mx.array(cu_chunk_lens, dtype=mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), constant_values=0)
 
