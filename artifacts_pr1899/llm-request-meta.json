@@ -1,0 +1,8 @@
+{
+  "bytes": 35198,
+  "n_tools": 35,
+  "system_len": 747,
+  "ci_len": 1471,
+  "pyo_head": "\n\n##### Pyodide Environment\n\n- This Python environment runs via Pyodide in the browser. **Do not install packages** — `pip install`, `subprocess`, and `micropip.install()` are not available.\n- If a required library is unavailable, use an alternative approach with available modules. Do not attempt to install anything.\n\n##### Persistent File System\n\n- User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.\n- You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.\n- The file system persists across code executions within the same session.\n- Use `import os; os.listdir('/mnt/uploads')` to discover available files.",
+  "ci_head": "\n#### Code Interpreter\n\nYou have access to a Python code interpreter via: `<code_interpreter type=\"code\" lang=\"python\"></code_interpreter>`\n\n- The Python shell runs directly in the user's browser for fast execution of analysis, calculations, or problem-solving. Use it in this response.\n- You can use a wide array of libraries for data manipulation, visualization, API calls, or any computational task. Think outside the box and harness Python's full potential.\n- **You must enclose your code within `<code_interpreter type=\"code\" lang=\"python\">` XML tags** and stop right away. If you don't, the code won't execute.\n- Do NOT use triple backticks (```py ... ```) inside the XML tags — that is markdown formatting, not executable Python code.\n- **Always print meaningful outputs** (results, tables, su"
+}

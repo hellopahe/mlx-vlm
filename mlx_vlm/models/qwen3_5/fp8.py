@@ -4,8 +4,8 @@ Qwen's Transformers FP8 checkpoints store E4M3 weight bytes alongside an
 arbitrary BF16 inverse scale for each 128x128 block.  MLX MXFP8 instead uses
 an E8M0 scale for every 32-value group and every output row, so the source
 weights cannot be reinterpreted directly (unlike DeepSeek V4's UE8M0
-checkpoints).  Reconstruct each source block lazily and immediately requantize
-it to the native MLX layout.
+checkpoints).  Reconstruct each source block and immediately requantize it to the
+native MLX layout, then materialize that tensor before the next one.
 """
 
 import mlx.core as mx
@@ -77,7 +77,7 @@ def _dequantize_qwen_fp8_weight(
 def quantize_qwen_fp8_weight(
     weight: mx.array, scale_inv: mx.array
 ) -> tuple[mx.array, mx.array]:
-    """Convert one Qwen block-FP8 tensor to native MLX MXFP8 lazily."""
+    """Convert one Qwen block-FP8 tensor to native MLX MXFP8 and materialize it."""
     if weight.shape[-1] % MLX_MXFP8_QUANTIZATION["group_size"] != 0:
         raise ValueError(
             "Qwen FP8 weight input dimension must be divisible by the MLX "
@@ -88,27 +88,44 @@ def quantize_qwen_fp8_weight(
     quantized = mx.quantize(restored, **MLX_MXFP8_QUANTIZATION)
     if len(quantized) != 2:
         raise ValueError("MLX MXFP8 quantization unexpectedly produced biases.")
-    return quantized
+    packed, scales = quantized
+    mx.eval(packed, scales)
+    mx.synchronize()
+    del restored
+    mx.clear_cache()
+    return packed, scales
 
 
 def convert_qwen_fp8_weights(
     weights: dict[str, mx.array],
 ) -> dict[str, mx.array]:
     """Replace Qwen ``weight_scale_inv`` pairs with MLX weight/scales pairs."""
+    import gc
+
     scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
     if not scale_keys:
         return weights
 
-    converted = dict(weights)
-    for scale_key in scale_keys:
+    print(
+        f"[qwen-fp8] converting {len(scale_keys)} tensors eagerly (eval+sync per tensor)",
+        flush=True,
+    )
+    for i, scale_key in enumerate(scale_keys, 1):
         weight_key = scale_key[: -len("_scale_inv")]
-        if weight_key not in converted:
+        if weight_key not in weights:
             raise ValueError(f"Missing FP8 weight for scale tensor {scale_key!r}.")
 
-        weight = converted.pop(weight_key)
-        scale_inv = converted.pop(scale_key)
+        weight = weights.pop(weight_key)
+        scale_inv = weights.pop(scale_key)
         packed, scales = quantize_qwen_fp8_weight(weight, scale_inv)
-        converted[weight_key] = packed
-        converted[weight_key[: -len(".weight")] + ".scales"] = scales
+        del weight, scale_inv
+        weights[weight_key] = packed
+        weights[weight_key[: -len(".weight")] + ".scales"] = scales
+        if i == 1 or i == len(scale_keys) or i % 25 == 0:
+            print(
+                f"[qwen-fp8] converted {i}/{len(scale_keys)} {weight_key}",
+                flush=True,
+            )
+            gc.collect()
 
-    return converted
+    return weights

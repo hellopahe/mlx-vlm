@@ -1,0 +1,11 @@
+{
+  "model": "/Users/tim/.cache/mlx-vlm/Qwen3.8-27B-MXFP4",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ping"
+    }
+  ],
+  "max_tokens": 1,
+  "stream": false
+}

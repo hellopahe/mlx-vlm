@@ -1,0 +1,10 @@
+{
+  "model": "/Users/tim/.cache/mlx-vlm/Qwen3.8-27B-MXFP4",
+  "messages": [
+    {
+      "role": "user",
+      "content": "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history, along with 1-3 more specific subtopic tags.\n\n### Guidelines:\n- Start with high-level domains (e.g. Science, Technology, Philosophy, Arts, Politics, Business, Health, Sports, Entertainment, Education)\n- Consider including relevant subfields/subdomains if they are strongly represented throughout the conversation\n- If content is too short (less than 3 messages) or too diverse, use only [\"General\"]\n- Use the chat's primary language; default to English if multilingual\n- Prioritize accuracy over specificity\n\n### Output:\nJSON format: { \"tags\": [\"tag1\", \"tag2\", \"tag3\"] }\n\n### Chat History:\n<chat_history>\nUSER: 你是谁？\nASSISTANT: 我是 Plex，由 Lex 创作。\n\n我擅长：\n- 搜索和总结网页内容\n- 查询你的知识库、聊天历史、笔记、记忆和日程\n- 处理文件、创建文档、改写文本\n- 编写代码、自动化任务、定时提醒\n\n你有什么想让我帮忙的吗？\n</chat_history>"
+    }
+  ],
+  "stream": false
+}

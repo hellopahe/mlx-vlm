@@ -13,6 +13,9 @@ except ImportError:
 import mlx.core as mx
 
 from mlx_vlm import load
+from mlx_vlm._pr1899_probe import install as _install_pr1899_probe
+
+_install_pr1899_probe()
 
 from .generate import PromptCacheState, stream_generate
 from .prompt_utils import get_chat_template, get_message_json
@@ -57,7 +60,11 @@ class ModelState:
 
         # Load new model
         self.config = load_config(model_name)
-        self.model, self.processor = load(model_name, trust_remote_code=True)
+        self.model, self.processor = load(
+            model_name, trust_remote_code=True, lazy=False
+        )
+        mx.eval(self.model.parameters())
+        mx.synchronize()
         self.image_processor = load_image_processor(model_name)
         self.current_model_name = model_name
         self.vision_cache.clear()

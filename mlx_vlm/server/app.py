@@ -447,6 +447,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_CAPTURE_DIR = (
+    "/Users/tim/Documents/talk/brainstorming/mlx-vlm-pr1899/artifacts_pr1899"
+)
+
+
+@app.middleware("http")
+async def _capture_chat_completions_body(request: Request, call_next):
+    if request.method == "POST" and request.url.path.rstrip("/").endswith(
+        "/chat/completions"
+    ):
+        body = await request.body()
+
+        def _write_capture() -> None:
+            os.makedirs(_CAPTURE_DIR, exist_ok=True)
+            latest = os.path.join(_CAPTURE_DIR, "llm-request-latest.json")
+            with open(latest, "wb") as fh:
+                fh.write(body)
+            with open(
+                os.path.join(_CAPTURE_DIR, "llm-request-capture.jsonl"), "ab"
+            ) as fh:
+                fh.write(body)
+                fh.write(b"\n")
+            logger.info(
+                "Captured chat completions body bytes=%d path=%s",
+                len(body),
+                latest,
+            )
+
+        try:
+            await asyncio.to_thread(_write_capture)
+        except Exception:
+            logger.exception("Failed to capture chat completions body")
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(request.scope, receive)
+    return await call_next(request)
+
 MAX_IMAGES = 10  # Maximum number of images to process at once
 
 

@@ -227,7 +227,10 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.tokens = []
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
+        token = int(token)
         if token in skip_special_token_ids:
+            return
+        if token < 0 or token >= len(self.tokenmap) or self.tokenmap[token] is None:
             return
         v = self.tokenmap[token]
         # if the token starts with space

@@ -1,0 +1,10 @@
+{
+  "model": "/Users/tim/.cache/mlx-vlm/Qwen3.8-27B-MXFP4",
+  "messages": [
+    {
+      "role": "user",
+      "content": "### Task:\nSuggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next in this conversation as a **user**, based on the chat history, to help continue or deepen the discussion.\n### Guidelines:\n- Write all follow-up questions from the user’s point of view, directed to the assistant.\n- Make questions concise, clear, and directly related to the discussed topic(s).\n- Only suggest follow-ups that make sense given the chat content and do not repeat what was already covered.\n- If the conversation is very short or not specific, suggest more general (but relevant) follow-ups the user might ask.\n- Use the conversation's primary language; default to English if multilingual.\n- Response must be a JSON object with a \"follow_ups\" key containing an array of strings, no extra text or formatting.\n### Output:\nJSON format: { \"follow_ups\": [\"Question 1?\", \"Question 2?\", \"Question 3?\"] }\n### Chat History:\n<chat_history>\nUSER: 你是谁？\nASSISTANT: 我是 Plex，由 Lex 创作。\n\n我擅长：\n- 搜索和总结网页内容\n- 查询你的知识库、聊天历史、笔记、记忆和日程\n- 处理文件、创建文档、改写文本\n- 编写代码、自动化任务、定时提醒\n\n你有什么想让我帮忙的吗？\n</chat_history>"
+    }
+  ],
+  "stream": false
+}
